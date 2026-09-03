@@ -1,29 +1,58 @@
 // ═══════════════════════════════════════════════════════════════
-// VPhone · 虚拟手机系统 v1.0
-// 通过 酒馆助手脚本 import 引入即可使用
-// GitHub: https://github.com/你的用户名/vphone
+// VPhone · 虚拟手机系统 v1.1
+// 通用型 · 零配置 · 基于聊天变量持久化
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
   'use strict';
 
   // ┌─────────────────────────────────────────────┐
-  // │  0. 读取用户配置                              │
+  // │  0. 等待环境就绪 & 自动获取配置               │
   // └─────────────────────────────────────────────┘
-  const USER_CFG = window.__VPHONE_CONFIG__ || {};
-  const CONFIG = {
-    wbName:   USER_CFG.wbName   || '',
-    wbUid:    USER_CFG.wbUid    ?? 0,
-    userName: USER_CFG.userName || '我',
-    debounce: USER_CFG.debounce || 1000,
-    containerId: 'vphone-root',
-    styleId:     'vphone-styles',
-  };
+  const waitFor = (checkFn, timeout = 8000) => new Promise((resolve, reject) => {
+    if (checkFn()) return resolve();
+    const start = Date.now();
+    const iv = setInterval(() => {
+      if (checkFn()) { clearInterval(iv); resolve(); }
+      else if (Date.now() - start > timeout) { clearInterval(iv); reject(new Error('[VPhone] 环境初始化超时')); }
+    }, 200);
+  });
 
-  if (!CONFIG.wbName) {
-    console.error('[VPhone] 未配置世界书名称。请在 __VPHONE_CONFIG__ 中设置 wbName。');
+  try {
+    await waitFor(() =>
+      typeof triggerSlash === 'function' &&
+      typeof getChatMessages === 'function' &&
+      typeof eventOn === 'function' &&
+      typeof get_chat_variable === 'function' &&
+      typeof set_chat_variable === 'function'
+    );
+  } catch (e) {
+    console.error(e.message);
     return;
   }
+
+  // 自动获取用户名（通过酒馆宏解析）
+  let USER_NAME = '我';
+  try {
+    const resolved = await triggerSlash('/echo {{user}}');
+    // /echo 会弹提示但也会返回内容，我们用更安静的方式
+  } catch (_) {}
+  // 更可靠的方式：从酒馆助手宏获取
+  try {
+    const nameFromMacro = '{{user}}';
+    // 酒馆助手会在脚本执行前替换宏，如果被替换了就用替换后的值
+    if (nameFromMacro && nameFromMacro !== '{' + '{user}}') {
+      USER_NAME = nameFromMacro;
+    }
+  } catch (_) {}
+
+  const CONFIG = {
+    userName: USER_NAME,
+    varKey: 'vphone_data',
+    debounce: 1000,
+    containerId: 'vphone-root',
+    styleId: 'vphone-styles',
+  };
 
   // ┌─────────────────────────────────────────────┐
   // │  1. 工具函数                                  │
@@ -31,10 +60,6 @@
   const escapeForST = (str) => {
     if (typeof str !== 'string') return str;
     return str.replace(/(\\+)?([|{}])/g, (m, s, c) => (s || '') + (s || '') + '\\' + c);
-  };
-  const escapeJsonForST = (str) => {
-    if (typeof str !== 'string') return str;
-    return str.replace(/(\\+)?\|/g, (m, s) => (s || '') + (s || '') + '\\|');
   };
   const sanitizeCoT = (text) => {
     if (!text) return '';
@@ -44,20 +69,23 @@
   const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
   // ┌─────────────────────────────────────────────┐
-  // │  2. 数据持久化层                              │
+  // │  2. 数据持久化层（聊天变量）                   │
   // └─────────────────────────────────────────────┘
   const Store = {
     _data: { chat: {}, social: { posts: [] }, memo: { notes: [] } },
     _timer: null,
     _dirty: false,
 
-    async load() {
+    load() {
       try {
-        const raw = await triggerSlash(
-          `/getentryfield file="${escapeForST(CONFIG.wbName)}" field=content ${CONFIG.wbUid}`
-        );
-        if (raw && raw.trim() && raw.trim() !== 'null' && raw.trim() !== '') {
-          const p = JSON.parse(raw.trim());
+        const raw = get_chat_variable(CONFIG.varKey);
+        if (raw && typeof raw === 'object') {
+          // get_chat_variable 直接返回对象（如果之前存的是对象）
+          this._data.chat   = raw.chat   || {};
+          this._data.social = raw.social || { posts: [] };
+          this._data.memo   = raw.memo   || { notes: [] };
+        } else if (raw && typeof raw === 'string') {
+          const p = JSON.parse(raw);
           if (p && typeof p === 'object') {
             this._data.chat   = p.chat   || {};
             this._data.social = p.social || { posts: [] };
@@ -78,18 +106,15 @@
       this._timer = setTimeout(() => this._flush(), CONFIG.debounce);
     },
 
-    async forceSave() {
+    forceSave() {
       if (this._timer) { clearTimeout(this._timer); this._timer = null; }
-      if (this._dirty) await this._flush();
+      if (this._dirty) this._flush();
     },
 
-    async _flush() {
+    _flush() {
       this._dirty = false;
       try {
-        const json = JSON.stringify(this._data);
-        await triggerSlash(
-          `/setentryfield file="${escapeForST(CONFIG.wbName)}" uid=${CONFIG.wbUid} field=content ${escapeJsonForST(json)}`
-        );
+        set_chat_variable(CONFIG.varKey, JSON.parse(JSON.stringify(this._data)));
       } catch (e) {
         console.error('[VPhone] 数据保存失败:', e);
         this._dirty = true;
@@ -125,6 +150,11 @@
         if (e.app === 'chat') {
           const from = e.from || '未知';
           if (!d.chat[from]) d.chat[from] = { messages: [], unread: 0 };
+          // 去重检查：防止重新生成/滑动时重复添加
+          const lastMsg = d.chat[from].messages[d.chat[from].messages.length - 1];
+          if (lastMsg && lastMsg.sender === from && lastMsg.content === (e.msg || '') && lastMsg.time === (e.time || getNow())) {
+            continue;
+          }
           d.chat[from].messages.push({
             sender: from,
             content: e.msg || '',
@@ -133,10 +163,16 @@
           d.chat[from].unread = (d.chat[from].unread || 0) + 1;
           changed = true;
         } else if (e.app === 'social') {
+          // 去重
+          const newContent = e.content || '';
+          const newPoster = e.poster || '匿名';
+          if (d.social.posts.some(p => p.poster === newPoster && p.content === newContent)) {
+            continue;
+          }
           d.social.posts.unshift({
             id: genId(),
-            poster: e.poster || '匿名',
-            content: e.content || '',
+            poster: newPoster,
+            content: newContent,
             image: e.image || '',
             time: e.time || getNow(),
             likes: Math.floor(Math.random() * 80) + 3,
@@ -406,10 +442,9 @@
 #vphone-root ::-webkit-scrollbar { width: 0px; }
 
 /* ═══════════════════════════════════════════ */
-/* ═══ Chat APP Styles                    ═══ */
+/* ═══ Chat APP                           ═══ */
 /* ═══════════════════════════════════════════ */
 
-/* ── Contact List ── */
 .vp-chat-list { display: flex; flex-direction: column; }
 
 .vp-chat-item {
@@ -431,9 +466,7 @@
   color: var(--vp-c-text-inv);
   overflow: hidden;
 }
-.vp-chat-avatar img {
-  width: 100%; height: 100%; object-fit: cover;
-}
+.vp-chat-avatar img { width: 100%; height: 100%; object-fit: cover; }
 
 .vp-chat-info {
   flex: 1; min-width: 0;
@@ -486,26 +519,22 @@
   width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
   background: var(--vp-c-accent); color: var(--vp-c-text-inv);
   display: flex; align-items: center; justify-content: center;
-  font-size: 13px;
-  overflow: hidden;
+  font-size: 13px; overflow: hidden;
 }
-.vp-msg-avatar-sm img {
-  width: 100%; height: 100%; object-fit: cover;
-}
+.vp-msg-avatar-sm img { width: 100%; height: 100%; object-fit: cover; }
+
 .vp-msg-bubble {
   padding: 9px 13px; border-radius: 18px;
   font-size: 14px; line-height: 1.45;
   word-break: break-word; position: relative;
 }
 .vp-msg-row:not(.is-self) .vp-msg-bubble {
-  background: var(--vp-c-bg-2);
-  color: var(--vp-c-text-1);
+  background: var(--vp-c-bg-2); color: var(--vp-c-text-1);
   border-top-left-radius: 6px;
   box-shadow: var(--vp-shadow-soft);
 }
 .vp-msg-row.is-self .vp-msg-bubble {
-  background: var(--vp-c-accent);
-  color: var(--vp-c-text-inv);
+  background: var(--vp-c-accent); color: var(--vp-c-text-inv);
   border-top-right-radius: 6px;
 }
 .vp-msg-time-tip {
@@ -523,13 +552,11 @@
 }
 .vp-chat-input {
   flex: 1; border: none; outline: none; resize: none;
-  background: var(--vp-c-bg-1);
-  color: var(--vp-c-text-1);
+  background: var(--vp-c-bg-1); color: var(--vp-c-text-1);
   border-radius: var(--vp-r-lg);
   padding: 9px 14px;
   font-size: 14px; font-family: inherit; line-height: 1.4;
-  max-height: 88px; min-height: 36px;
-  overflow-y: auto;
+  max-height: 88px; min-height: 36px; overflow-y: auto;
 }
 .vp-chat-input::placeholder { color: var(--vp-c-text-3); }
 
@@ -548,22 +575,6 @@
   cursor: not-allowed; transform: none;
 }
 
-/* ═══ Typing indicator ═══ */
-.vp-typing {
-  display: flex; gap: 4px; padding: 12px 16px; align-items: center;
-}
-.vp-typing-dot {
-  width: 7px; height: 7px; border-radius: 50%;
-  background: var(--vp-c-text-3);
-  animation: vp-dot-bounce 1.2s infinite ease-in-out;
-}
-.vp-typing-dot:nth-child(2) { animation-delay: 0.15s; }
-.vp-typing-dot:nth-child(3) { animation-delay: 0.3s; }
-@keyframes vp-dot-bounce {
-  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
-  30% { transform: translateY(-5px); opacity: 1; }
-}
-
 /* ═══ New Chat FAB ═══ */
 .vp-chat-fab {
   position: absolute; bottom: 16px; right: 16px;
@@ -577,16 +588,14 @@
 .vp-chat-fab:hover { transform: scale(1.08); box-shadow: 0 6px 18px rgba(0,122,255,0.4); }
 .vp-chat-fab:active { transform: scale(0.92); }
 
-/* ═══ New Chat Dialog ═══ */
+/* ═══ Dialog ═══ */
 .vp-dialog-overlay {
   position: absolute; inset: 0; z-index: 50;
   background: rgba(0,0,0,0.3);
   display: flex; align-items: center; justify-content: center;
   animation: vp-fade-in 0.2s ease;
 }
-@keyframes vp-fade-in {
-  from { opacity: 0; } to { opacity: 1; }
-}
+@keyframes vp-fade-in { from { opacity: 0; } to { opacity: 1; } }
 .vp-dialog {
   background: var(--vp-c-bg-2); border-radius: var(--vp-r-md);
   padding: 20px; width: 80%; max-width: 260px;
@@ -610,10 +619,7 @@
 }
 .vp-dialog input[type="text"]:focus { border-color: var(--vp-c-accent); }
 .vp-dialog input[type="text"]::placeholder { color: var(--vp-c-text-3); }
-
-.vp-dialog-btns {
-  display: flex; gap: 8px; justify-content: flex-end;
-}
+.vp-dialog-btns { display: flex; gap: 8px; justify-content: flex-end; }
 .vp-dialog-btns button {
   padding: 7px 16px; border-radius: var(--vp-r-sm);
   border: none; font-size: 14px; font-family: inherit;
@@ -669,18 +675,18 @@
   // ┌─────────────────────────────────────────────┐
   // │  6. 路由 & APP注册                            │
   // └─────────────────────────────────────────────┘
-  const $ = (sel, ctx) => (ctx || rootEl).querySelector(sel);
-  const $$ = (sel, ctx) => [...(ctx || rootEl).querySelectorAll(sel)];
+  const _$ = (sel, ctx) => (ctx || rootEl).querySelector(sel);
+  const _$$ = (sel, ctx) => [...(ctx || rootEl).querySelectorAll(sel)];
 
-  const shell      = $('.vp-shell');
-  const desktop    = $('.vp-desktop');
-  const grid       = $('#vp-desktop-grid');
-  const appview    = $('#vp-appview');
-  const appTitle   = $('#vp-appview-title');
-  const appBody    = $('#vp-appview-body');
-  const backBtn    = $('#vp-back-btn');
-  const closeBtn   = $('.vp-close');
-  const timeEl     = $('.vp-statusbar-time');
+  const shell      = _$('.vp-shell');
+  const desktop    = _$('.vp-desktop');
+  const grid       = _$('#vp-desktop-grid');
+  const appview    = _$('#vp-appview');
+  const appTitle   = _$('#vp-appview-title');
+  const appBody    = _$('#vp-appview-body');
+  const backBtn    = _$('#vp-back-btn');
+  const closeBtn   = _$('.vp-close');
+  const timeEl     = _$('.vp-statusbar-time');
 
   let currentApp = null;
   const apps = {};
@@ -729,7 +735,13 @@
     }
   }
 
-  backBtn.addEventListener('click', closeApp);
+  // 返回按钮的默认行为
+  let _backHandler = closeApp;
+  backBtn.addEventListener('click', () => _backHandler());
+
+  function setBackHandler(fn) { _backHandler = fn; }
+  function resetBackHandler() { _backHandler = closeApp; }
+
   closeBtn.addEventListener('click', () => {
     shell.setAttribute('data-state', 'hidden');
   });
@@ -752,7 +764,12 @@
 
   eventOn('vphone:data_changed', () => {
     updateBadges();
-    refreshApp();
+    // 仅在聊天室视图时增量刷新，其他视图全量刷新
+    if (currentApp === 'chat' && ChatApp._currentContact) {
+      ChatApp._incrementalRefresh();
+    } else if (currentApp) {
+      refreshApp();
+    }
   });
 
   // ┌─────────────────────────────────────────────┐
@@ -764,11 +781,13 @@
 
     onOpen(container, data) {
       this._currentContact = null;
+      resetBackHandler();
       this._renderContactList(container, data);
     },
 
     onClose() {
       this._currentContact = null;
+      resetBackHandler();
     },
 
     _renderContactList(container, data) {
@@ -811,7 +830,7 @@
                   <span class="vp-chat-name">${name}</span>
                   <span class="vp-chat-time">${last?.time || ''}</span>
                 </div>
-                <span class="vp-chat-preview">${last ? (last.sender === CONFIG.userName ? '我：' : '') + last.content : ''}</span>
+                <span class="vp-chat-preview">${last ? (last.sender === CONFIG.userName ? '我：' : '') + this._escapeHtml(last.content) : ''}</span>
               </div>
               ${badgeHtml}`;
 
@@ -823,7 +842,7 @@
       }
       wrapper.appendChild(listEl);
 
-      // FAB：新建对话
+      // FAB
       const fab = hostDoc.createElement('button');
       fab.className = 'vp-chat-fab';
       fab.innerHTML = '<i class="fas fa-pen"></i>';
@@ -840,7 +859,6 @@
       const thread = data.chat[contactName];
       if (!thread) return;
 
-      // 标记已读
       thread.unread = 0;
       Store.save();
       updateBadges();
@@ -850,7 +868,6 @@
       const room = hostDoc.createElement('div');
       room.className = 'vp-chatroom';
 
-      // 消息区
       const msgArea = hostDoc.createElement('div');
       msgArea.className = 'vp-chatroom-messages';
       msgArea.id = 'vp-chatroom-msgs';
@@ -892,7 +909,6 @@
         this._sending = true;
         sendBtn.disabled = true;
 
-        // 乐观UI更新
         const time = getNow();
         const myMsg = { sender: CONFIG.userName, content: text, time };
         thread.messages.push(myMsg);
@@ -903,7 +919,6 @@
 
         Store.save();
 
-        // 发送给AI
         try {
           const safeName = escapeForST(contactName);
           const safeText = escapeForST(text);
@@ -928,24 +943,43 @@
       inputBar.appendChild(sendBtn);
       room.appendChild(inputBar);
 
-      // 返回按钮覆盖：回到联系人列表
-      const originalBack = backBtn.onclick;
-      backBtn.onclick = null;
-      const backHandler = () => {
-        backBtn.removeEventListener('click', backHandler);
-        backBtn.addEventListener('click', () => closeApp());
+      // 覆盖返回按钮：回到联系人列表
+      setBackHandler(() => {
         appTitle.textContent = '消息';
         this._currentContact = null;
+        resetBackHandler();
         container.innerHTML = '';
         this._renderContactList(container, Store.data);
-      };
-      backBtn.removeEventListener('click', closeApp);
-      backBtn.addEventListener('click', backHandler);
+      });
 
       container.innerHTML = '';
       container.appendChild(room);
 
       requestAnimationFrame(() => this._scrollToBottom(msgArea));
+    },
+
+    _incrementalRefresh() {
+      const contact = this._currentContact;
+      if (!contact) return;
+      const thread = Store.data.chat[contact];
+      if (!thread) return;
+
+      const msgArea = rootEl.querySelector('#vp-chatroom-msgs');
+      if (!msgArea) return;
+
+      const rendered = msgArea.querySelectorAll('.vp-msg-row').length;
+
+      if (thread.messages.length > rendered) {
+        const newMsgs = thread.messages.slice(rendered);
+        newMsgs.forEach((msg) => {
+          msgArea.appendChild(this._createMsgBubble(msg, contact));
+        });
+        this._scrollToBottom(msgArea);
+
+        thread.unread = 0;
+        Store.save();
+        updateBadges();
+      }
     },
 
     _createMsgBubble(msg, contactName) {
@@ -996,7 +1030,6 @@
       const okBtn = overlay.querySelector('.vp-dialog-btn-ok');
 
       const close = () => overlay.remove();
-
       cancelBtn.addEventListener('click', close);
       overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 
@@ -1021,38 +1054,8 @@
     },
   };
 
-  // 监听数据变化时聊天室的实时刷新
-  eventOn('vphone:data_changed', () => {
-    if (currentApp === 'chat' && ChatApp._currentContact) {
-      const contact = ChatApp._currentContact;
-      const thread = Store.data.chat[contact];
-      if (!thread) return;
-
-      const msgArea = rootEl.querySelector('#vp-chatroom-msgs');
-      if (!msgArea) return;
-
-      // 追加新消息（不全量重绘）
-      const rendered = msgArea.querySelectorAll('.vp-msg-row').length;
-      const timeTips = msgArea.querySelectorAll('.vp-msg-time-tip').length;
-      const totalRendered = rendered;
-
-      if (thread.messages.length > totalRendered) {
-        const newMsgs = thread.messages.slice(totalRendered);
-        newMsgs.forEach((msg) => {
-          msgArea.appendChild(ChatApp._createMsgBubble(msg, contact));
-        });
-        ChatApp._scrollToBottom(msgArea);
-
-        // 在聊天室里时自动标记已读
-        thread.unread = 0;
-        Store.save();
-        updateBadges();
-      }
-    }
-  });
-
   // ┌─────────────────────────────────────────────┐
-  // │  8. 占位APP注册                                │
+  // │  8. APP注册                                   │
   // └─────────────────────────────────────────────┘
   registerApp('chat', {
     name: '消息',
@@ -1086,7 +1089,7 @@
   // ┌─────────────────────────────────────────────┐
   // │  9. 启动                                      │
   // └─────────────────────────────────────────────┘
-  await Store.load();
+  Store.load();
   renderDesktop();
 
   // 按钮注册
@@ -1097,13 +1100,13 @@
   });
 
   // 脚本关闭时清理
-  $(window).on('pagehide', async () => {
-    await Store.forceSave();
+  $(window).on('pagehide', () => {
+    Store.forceSave();
     const c = hostDoc.getElementById(CONFIG.containerId);
     if (c) c.remove();
     const s = hostDoc.getElementById(CONFIG.styleId);
     if (s) s.remove();
   });
 
-  console.log('[VPhone] 系统启动完毕 ✓');
+  console.log('[VPhone] v1.1 系统启动完毕 ✓ (聊天变量持久化)');
 })();
